@@ -1,0 +1,137 @@
+From 8e397acf78e183004cdb90acd8a8160387d99a45 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Wed, 12 Nov 2025 22:44:06 -0800
+Subject: [PATCH] Add HCI ACL data support and comprehensive BLE packet logging
+
+This patch adds support for HCI ACL Data packets (type 0x02) which carry
+L2CAP/ATT layer data needed for GATT services to function properly.
+
+Changes:
+1. wsm.h: Define HI_MSG_ID_BLE_DATA (0x905) for ACL data from firmware
+2. wsm.h: Add BLE_MSG_TYPE_* definitions for message type identifiers
+3. wsm.c: Handle BLE_DATA messages and add logging for all BLE messages
+4. ble.c: Add detailed logging for both RX and TX HCI packets
+
+All logging uses atbm_printk_always() to ensure visibility regardless of
+debug level settings.
+
+The logging will show:
+- What message IDs the firmware is actually sending
+- What HCI packet types are being received/transmitted
+- Whether ACL data is being forwarded or not
+
+If the firmware sends ACL data with HI_MSG_ID_BLE_DATA, it will now be
+properly forwarded to BlueZ. If not, the logs will show what's missing.
+---
+ hal_apollo/mac80211/ble.c | 30 +++++++++++++++++++++++++++++-
+ hal_apollo/wsm.c          | 17 +++++++++++++----
+ hal_apollo/wsm.h          |  7 +++++++
+ 3 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index d49e7f1..1dec4f3 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -847,7 +847,20 @@ static int ieee80211_ble_bluez_submit_skb(struct ieee80211_ble_file *ble_file,st
+ 	pkt_type = skb->data[0];
+ 
+ 	atbm_skb_pull(skb,1);
+-	
++
++	/* Log HCI packet type for debugging */
++	atbm_printk_always("BLE RX from FW: pkt_type=0x%02x len=%d\n", pkt_type, skb->len);
++	if (pkt_type == 0x01)
++		atbm_printk_always("  -> HCI_COMMAND_PKT\n");
++	else if (pkt_type == 0x02)
++		atbm_printk_always("  -> HCI_ACLDATA_PKT (L2CAP/ATT)\n");
++	else if (pkt_type == 0x03)
++		atbm_printk_always("  -> HCI_SCODATA_PKT\n");
++	else if (pkt_type == 0x04)
++		atbm_printk_always("  -> HCI_EVENT_PKT\n");
++	else
++		atbm_printk_always("  -> UNKNOWN PKT TYPE!\n");
++
+ 	atbm_printk_ble("bluezsubmit out(%zu)(%d)(%d)\n",cb->size,skb->len,pkt_type);
+ 
+ 	bt_skb = bt_skb_alloc(skb->len,GFP_ATOMIC);
+@@ -1260,6 +1273,21 @@ static int ieee80211_ble_bluez_send_frame(
+ 		break;
+ 	};
+ 
++	/* Log outgoing HCI packets */
++	atbm_printk_always("BLE TX to FW: pkt_type=0x%02x len=%d\n", bt_cb(skb)->pkt_type, skb->len);
++	if (bt_cb(skb)->pkt_type == HCI_COMMAND_PKT)
++		atbm_printk_always("  -> HCI_COMMAND_PKT\n");
++	else if (bt_cb(skb)->pkt_type == HCI_ACLDATA_PKT) {
++		int i, dump_len = (skb->len < 16) ? skb->len : 16;
++		atbm_printk_always("  -> HCI_ACLDATA_PKT (L2CAP/ATT)\n");
++		atbm_printk_always("  -> ACL DATA DUMP (first %d bytes): ", dump_len);
++		for (i = 0; i < dump_len; i++)
++			atbm_printk_always("%02x ", skb->data[i]);
++		atbm_printk_always("\n");
++	}
++	else if (bt_cb(skb)->pkt_type == HCI_SCODATA_PKT)
++		atbm_printk_always("  -> HCI_SCODATA_PKT\n");
++
+ #ifdef CONFIG_ATBM_BLE_ADV_COEXIST
+ 	/* Intercept HCI commands for LE advertising */
+ 	if (bt_cb(skb)->pkt_type == HCI_COMMAND_PKT && skb->len >= 4) {
+diff --git a/hal_apollo/wsm.c b/hal_apollo/wsm.c
+index a907023..063dae4 100644
+--- a/hal_apollo/wsm.c
++++ b/hal_apollo/wsm.c
+@@ -2778,20 +2778,29 @@ int wsm_handle_rx(struct atbm_common *hw_priv, int id,
+ 		ret = 0; /* Error response from device should ne stop BH. */
+ 
+ 		wake_up(&hw_priv->wsm_cmd_wq);
+-	} 
++	}
+ #ifdef CONFIG_WIFI_BT_COMB
+-	else if (id & HI_MSG_ID_BLE_BIT) {		
++	else if (id & HI_MSG_ID_BLE_BIT) {
++		/* Log all BLE messages from firmware for debugging */
++		atbm_printk_always("BLE MSG from FW: id=0x%04x len=%d\n", id, __le16_to_cpu(wsm->len));
++
+ 		switch (id) {
+ 			case HI_MSG_ID_BLE_EVENT:
+ 				wsm->id = BLE_MSG_TYPE_EVT;
++				atbm_printk_always("  -> HCI EVENT packet\n");
+ //				atbm_ble_dev_rx((u8 *)wsm, wsm->len);
+-				break;	
++				break;
+ 			case HI_MSG_ID_BLE_ACK:
+ 				wsm->id = BLE_MSG_TYPE_ACK;
++				atbm_printk_always("  -> BLE ACK packet\n");
+ //				atbm_ble_dev_rx((u8 *)wsm, wsm->len);
+ 				break;
++			case HI_MSG_ID_BLE_DATA:
++				wsm->id = BLE_MSG_TYPE_DATA;
++				atbm_printk_always("  -> HCI ACL DATA packet\n");
++				break;
+ 			default:
+-				atbm_printk_err("%s %d : id = %x\n",__func__,__LINE__,id);
++				atbm_printk_err("%s %d : Unknown BLE msg id = 0x%04x\n",__func__,__LINE__,id);
+ 				//BUG_ON(1);
+ 				return -1;
+ 		}
+diff --git a/hal_apollo/wsm.h b/hal_apollo/wsm.h
+index 743fa69..3a11f33 100644
+--- a/hal_apollo/wsm.h
++++ b/hal_apollo/wsm.h
+@@ -2783,6 +2783,13 @@ int wsm_ble_indication(struct atbm_common *hw_priv, struct wsm_buf *buf, int if_
+ #define HI_MSG_ID_BLE_BASE_CNF		(HI_MSG_ID_BLE_BASE | WSM_CNF_BASE)
+ #define HI_MSG_ID_BLE_EVENT			(HI_MSG_ID_BLE_BASE+0x03)
+ #define HI_MSG_ID_BLE_ACK			(HI_MSG_ID_BLE_BASE+0x04)
++#define HI_MSG_ID_BLE_DATA			(HI_MSG_ID_BLE_BASE+0x05)
++
++/* BLE message type identifiers for wsm->id field */
++#define BLE_MSG_TYPE_EVT			1
++#define BLE_MSG_TYPE_ACK			2
++#define BLE_MSG_TYPE_DATA			3
++
+ int wsm_ble_xmit(struct atbm_common *hw_priv,u8 *xmit,size_t len);
+ #endif
+ 
+-- 
+2.39.5 (Apple Git-154)
+

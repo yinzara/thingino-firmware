@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Wed, 13 Nov 2025 18:30:00 -0800
+Subject: [PATCH] Auto-stop coexist mode on BLE connection for stable GATT
+
+CRITICAL FIX: Automatically manage WiFi/BLE coexistence mode during BLE
+connection lifecycle.
+
+The WiFiBLEComb firmware has resource constraints when operating in coexistence
+mode. As seen in ble_coexist_demo.c, the correct pattern is:
+1. Use coexistence mode for advertising (to allow WiFi and BLE scanning)
+2. Immediately stop coexistence after connection (dedicate full resources to BLE)
+3. Restart coexistence after disconnection (resume advertising)
+
+Without this, connections fail after ~7-10 seconds with Hardware Failure (0x03)
+because the firmware cannot maintain stable GATT operations while juggling
+WiFi/BLE coexistence.
+
+Changes:
+- Add connection state tracking (atbm_ble_connected)
+- Detect LE Connection Complete events (0x3E subevent 0x01)
+- Send BLE_MSG_COEXIST_STOP to firmware on successful connection
+- Detect Disconnection Complete events (0x05)
+- Send BLE_MSG_COEXIST_START to firmware on disconnection
+- Firmware command pattern matches ble_coexist_demo.c reference
+
+This allows stable GATT server connections that can persist for extended
+periods without hardware failure disconnects.
+---
+ hal_apollo/mac80211/ble.c | 78 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 67159b7..6547b82 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -162,6 +162,11 @@ static struct cdev ble_device_cdev;
+ static struct class *ble_class;
+ static dev_t ble_devt;
+
++#ifdef CONFIG_WIFI_BT_COMB
++/* Track BLE connection state for automatic coexistence management */
++static bool atbm_ble_connected = false;
++#endif
++
+ #define ATBM_BLE_DEVICE_MAJOR   100
+ #define ATBM_BLE_DEVICE_DEV		MKDEV(ATBM_BLE_DEVICE_MAJOR, 0)
+ #define ATBM_BLE_MAX			1
+@@ -808,6 +813,78 @@ err:
+ #ifdef CONFIG_ATBM_SUPPORT_BLUEZ
+ static void ieee80211_ble_bluez_recv(struct hci_dev *hdev,struct sk_buff *skb)
+ {
++#ifdef CONFIG_WIFI_BT_COMB
++	/* In native HCI mode (WiFiBLEComb firmware), automatically manage coexistence:
++	 * - Stop coexist mode after connection (dedicate full resources to BLE)
++	 * - Restart advertising after disconnection (for next connection)
++	 * This matches the behavior in ble_coexist_demo.c
++	 */
++	if (bt_cb(skb)->pkt_type == 0x04 && skb->len >= 2) { /* HCI_EVENT_PKT */
++		uint8_t event_code = skb->data[0];
++		uint8_t param_len = skb->data[1];
++
++		/* LE Meta Event (0x3E) with LE Connection Complete subevent (0x01) */
++		if (event_code == 0x3E && param_len >= 1 && skb->len >= 3) {
++			uint8_t subevent = skb->data[2];
++
++			if (subevent == 0x01 && skb->len >= 4) { /* LE Connection Complete */
++				uint8_t status = skb->data[3];
++
++				if (status == 0x00 && !atbm_ble_connected) { /* Success */
++					struct ieee80211_ble_cdev *ble_cdev = dev_get_drvdata(&hdev->dev);
++
++					if (ble_cdev && ble_cdev->pdev) {
++						struct ieee80211_local *local = ble_cdev->pdev->dev.platform_data;
++
++						if (local) {
++							struct atbm_common *hw_priv = local->hw.priv;
++							struct wsm_ble_msg ble_stop = {0};
++
++							atbm_printk_always("BLE: LE Connection Complete - STOPPING coexist mode for stable GATT\n");
++
++							/* Stop WiFi/BLE coexistence to dedicate full resources to BLE connection */
++							ble_stop.ble_id = BLE_MSG_COEXIST_STOP;
++							wsm_ble_msg_coexist_stop(hw_priv, &ble_stop, 0);
++
++							atbm_ble_connected = true;
++						}
++					}
++				}
++			}
++		}
++		/* Disconnection Complete Event (0x05) */
++		else if (event_code == 0x05 && skb->len >= 4) {
++			uint8_t status = skb->data[2];
++
++			if (status == 0x00 && atbm_ble_connected) { /* Success */
++				struct ieee80211_ble_cdev *ble_cdev = dev_get_drvdata(&hdev->dev);
++
++				if (ble_cdev && ble_cdev->pdev) {
++					struct ieee80211_local *local = ble_cdev->pdev->dev.platform_data;
++
++					if (local) {
++						struct atbm_common *hw_priv = local->hw.priv;
++						struct wsm_ble_msg_coex_start ble_start = {0};
++
++						atbm_printk_always("BLE: Disconnection Complete - restarting coexistence for advertising\n");
++
++						/* Restart coexistence mode so advertising can resume */
++						ble_start.ble_id = BLE_MSG_COEXIST_START;
++						ble_start.interval = 100; /* 100ms default interval */
++						ble_start.coex_flag = (1 << 0) | (1 << 8); /* ADV enabled, channel 39 */
++						ble_start.scan_win = 0;
++						ble_start.chan_flag = (1 << 7); /* Channel 39 flag */
++
++						wsm_ble_msg_coexist_start(hw_priv, &ble_start, 0);
++
++						atbm_ble_connected = false;
++					}
++				}
++			}
++		}
++	}
++#endif
++
+ 	/* Ensure LE is enabled for incoming connections */
+ 	set_bit(HCI_LE_ENABLED, &hdev->dev_flags);
+
+--
+2.43.0
+

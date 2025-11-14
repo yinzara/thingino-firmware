@@ -1,0 +1,562 @@
+#!/bin/sh
+#
+# ble-provision - BLE Complete Device Provisioning Service
+#
+# Provides a BLE GATT service for configuring WiFi, admin, and hostname
+# Activated automatically when device is not configured
+#
+# GATT Service UUID: 00000001-0000-1000-8000-00805f9b34fb (Thingino Provisioning)
+# Characteristics:
+#   - WiFi Scan (read):        00000002-... - List available networks (JSON)
+#   - WiFi SSID (write):       00000003-... - Set target SSID
+#   - WiFi Password (write):   00000004-... - Set WiFi password
+#   - Status (read/notify):    00000005-... - Provisioning status
+#   - Admin Username (write):  00000006-... - Set admin username
+#   - Admin Password (write):  00000007-... - Set admin password
+#   - Hostname (write):        00000008-... - Set device hostname (mDNS)
+#
+
+# Logging helper
+log() {
+	echo "[$(date '+%Y-%m-%d %H:%M:%S')] [BLE-PROV] $*"
+	logger -t ble-provision "$*"
+}
+
+# Check if already provisioned
+is_wifi_configured() {
+	# Check if wlanssid is set in U-Boot environment
+	if fw_printenv wlanssid 2>/dev/null | grep -q "wlanssid="; then
+		return 0  # Configured
+	fi
+	return 1  # Not configured
+}
+
+# Check if admin credentials are configured
+is_admin_configured() {
+	# Check if root password is set (not default)
+	if [ -f /etc/shadow ]; then
+		# Check if root has a password hash (not empty or *)
+		ROOT_HASH=$(grep "^root:" /etc/shadow | cut -d: -f2)
+		if [ -n "$ROOT_HASH" ] && [ "$ROOT_HASH" != "*" ] && [ "$ROOT_HASH" != "!" ]; then
+			return 0  # Configured
+		fi
+	fi
+	return 1  # Not configured
+}
+
+# Check if device needs any provisioning
+needs_provisioning() {
+	if ! is_wifi_configured; then
+		return 0  # Needs WiFi provisioning
+	fi
+	if ! is_admin_configured; then
+		return 0  # Needs admin provisioning
+	fi
+	return 1  # Fully configured
+}
+
+# Check dependencies
+check_dependencies() {
+	if ! command -v bluetoothctl >/dev/null 2>&1; then
+		log "ERROR: bluetoothctl not found (install bluez5-utils)"
+		exit 1
+	fi
+
+	if ! hciconfig hci0 >/dev/null 2>&1; then
+		log "ERROR: Bluetooth adapter hci0 not found"
+		exit 1
+	fi
+}
+
+# Get device MAC address for unique name
+get_device_id() {
+	# Use last 4 characters of wlan0 MAC
+	if [ -f /sys/class/net/wlan0/address ]; then
+		MAC=$(cat /sys/class/net/wlan0/address | tr -d ':' | tail -c 5)
+	else
+		# Fallback to random
+		MAC=$(head -c 2 /dev/urandom | hexdump -e '"%04X"')
+	fi
+	echo "$MAC"
+}
+
+# Scan WiFi networks and format as JSON
+scan_wifi() {
+	log "Scanning for WiFi networks..."
+
+	# Bring up interface temporarily if needed
+	ifconfig wlan0 up 2>/dev/null
+
+	# Use iw (included in bluetooth fragment)
+	if command -v iw >/dev/null 2>&1; then
+		iw dev wlan0 scan 2>/dev/null | awk '
+		BEGIN { print "[" }
+		/^BSS/ {
+			if (ssid != "") {
+				printf "%s{\"ssid\":\"%s\",\"signal\":%d,\"security\":\"%s\"}",
+					(first ? "" : ","), ssid, signal, security
+				first = 0
+			}
+			ssid = ""; signal = -100; security = "open"
+		}
+		/SSID:/ { for(i=2; i<=NF; i++) ssid = ssid (i==2?"":" ") $i }
+		/signal:/ { signal = $2 }
+		/WPA/ { security = "WPA" }
+		/RSN/ { security = "WPA2" }
+		END {
+			if (ssid != "") {
+				printf "%s{\"ssid\":\"%s\",\"signal\":%d,\"security\":\"%s\"}",
+					(first ? "" : ","), ssid, signal, security
+			}
+			print "]"
+		}
+		' first=1
+	else
+		# Fallback if iw not available
+		log "ERROR: iw command not found - WiFi scanning unavailable"
+		echo "[]"
+	fi
+}
+
+# Apply WiFi credentials
+apply_wifi_credentials() {
+	SSID="$1"
+	PASS="$2"
+
+	log "Applying WiFi credentials for SSID: $SSID"
+
+	# Set U-Boot environment variables
+	fw_setenv wlanssid "$SSID"
+	fw_setenv wlanpass "$PASS"
+
+	# Try to connect immediately
+	log "Attempting WiFi connection..."
+	if command -v wpa_supplicant >/dev/null 2>&1; then
+		# Kill any existing wpa_supplicant
+		killall wpa_supplicant 2>/dev/null
+		sleep 1
+
+		# Create wpa_supplicant config
+		cat > /tmp/wpa_supplicant.conf <<EOF
+network={
+	ssid="$SSID"
+	psk="$PASS"
+	key_mgmt=WPA-PSK
+}
+EOF
+		# Start wpa_supplicant
+		wpa_supplicant -B -i wlan0 -c /tmp/wpa_supplicant.conf 2>/dev/null
+		sleep 5
+
+		# Check if connected using iw
+		if command -v iw >/dev/null 2>&1; then
+			# Check if associated to an AP
+			if iw dev wlan0 link 2>/dev/null | grep -q "Connected to"; then
+				log "SUCCESS: WiFi connected to $SSID"
+				echo "connected"
+				# Get IP via DHCP
+				udhcpc -i wlan0 -q 2>/dev/null &
+				return 0
+			fi
+		fi
+
+		# Fallback: Check if wlan0 has an IP address
+		if ifconfig wlan0 2>/dev/null | grep -q "inet addr:"; then
+			log "SUCCESS: WiFi connected to $SSID (has IP)"
+			echo "connected"
+			return 0
+		elif ip addr show wlan0 2>/dev/null | grep -q "inet "; then
+			log "SUCCESS: WiFi connected to $SSID (has IP)"
+			echo "connected"
+			return 0
+		fi
+
+		log "WARNING: Failed to connect to $SSID"
+		echo "failed"
+		return 1
+	else
+		log "WARNING: wpa_supplicant not available, credentials saved for next boot"
+		echo "saved"
+		return 0
+	fi
+}
+
+# Apply admin credentials
+apply_admin_credentials() {
+	USERNAME="$1"
+	PASSWORD="$2"
+
+	log "Applying admin credentials for user: $USERNAME"
+
+	# Set root password
+	if [ "$USERNAME" = "root" ] || [ -z "$USERNAME" ]; then
+		log "Setting root password..."
+		echo "root:$PASSWORD" | chpasswd 2>/dev/null
+		if [ $? -eq 0 ]; then
+			log "SUCCESS: Root password set"
+
+			# Also save to U-Boot env for web interface
+			fw_setenv root_password "$PASSWORD" 2>/dev/null
+
+			echo "admin_set"
+			return 0
+		else
+			log "ERROR: Failed to set root password"
+			echo "admin_failed"
+			return 1
+		fi
+	else
+		# Create new user if not root
+		log "Creating user: $USERNAME"
+
+		# Check if user exists
+		if ! id "$USERNAME" >/dev/null 2>&1; then
+			adduser -D -h /home/"$USERNAME" -s /bin/sh "$USERNAME" 2>/dev/null
+		fi
+
+		# Set password
+		echo "$USERNAME:$PASSWORD" | chpasswd 2>/dev/null
+		if [ $? -eq 0 ]; then
+			log "SUCCESS: User $USERNAME created/updated"
+
+			# Add to admin group if it exists
+			if grep -q "^admin:" /etc/group; then
+				addgroup "$USERNAME" admin 2>/dev/null
+			fi
+
+			# Save to U-Boot env
+			fw_setenv admin_username "$USERNAME" 2>/dev/null
+			fw_setenv admin_password "$PASSWORD" 2>/dev/null
+
+			echo "admin_set"
+			return 0
+		else
+			log "ERROR: Failed to set password for $USERNAME"
+			echo "admin_failed"
+			return 1
+		fi
+	fi
+}
+
+# Apply hostname
+apply_hostname() {
+	HOSTNAME="$1"
+
+	# Validate hostname
+	if [ -z "$HOSTNAME" ]; then
+		log "ERROR: Hostname cannot be empty"
+		echo "hostname_failed"
+		return 1
+	fi
+
+	# Sanitize hostname (lowercase alphanumeric + hyphen, must start with letter)
+	HOSTNAME=$(echo "$HOSTNAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/^[^a-z]*//')
+
+	if [ -z "$HOSTNAME" ]; then
+		log "ERROR: Invalid hostname after sanitization"
+		echo "hostname_failed"
+		return 1
+	fi
+
+	log "Setting hostname to: $HOSTNAME"
+
+	# Set hostname immediately
+	hostname "$HOSTNAME"
+
+	# Save to /etc/hostname
+	echo "$HOSTNAME" > /etc/hostname
+
+	# Save to U-Boot environment
+	fw_setenv hostname "$HOSTNAME" 2>/dev/null
+
+	# Update /etc/hosts
+	if ! grep -q "127.0.1.1" /etc/hosts; then
+		echo "127.0.1.1	$HOSTNAME" >> /etc/hosts
+	else
+		sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$HOSTNAME/" /etc/hosts
+	fi
+
+	# Restart avahi/mDNS if running
+	if pidof avahi-daemon >/dev/null 2>&1; then
+		killall -HUP avahi-daemon 2>/dev/null
+		log "Reloaded mDNS service with new hostname"
+	fi
+
+	log "SUCCESS: Hostname set to $HOSTNAME"
+	echo "hostname_set"
+	return 0
+}
+
+# Start BLE advertising
+start_advertising() {
+	DEVICE_ID=$(get_device_id)
+	DEVICE_NAME="Thingino-$DEVICE_ID"
+
+	log "Starting BLE provisioning service as: $DEVICE_NAME"
+
+	# Set device name
+	hciconfig hci0 name "$DEVICE_NAME"
+
+	# Make discoverable and pairable
+	bluetoothctl <<EOF
+power on
+discoverable on
+pairable on
+agent NoInputNoOutput
+default-agent
+EOF
+
+	log "Device discoverable as: $DEVICE_NAME"
+	log "Waiting for provisioning via BLE..."
+}
+
+# Main provisioning loop using simple characteristic files
+provision_loop() {
+	PROV_DIR="/tmp/ble_provision"
+	mkdir -p "$PROV_DIR"
+
+	# Create control files
+	> "$PROV_DIR/ssid"
+	> "$PROV_DIR/password"
+	> "$PROV_DIR/admin_username"
+	> "$PROV_DIR/admin_password"
+	> "$PROV_DIR/hostname"
+	echo "waiting" > "$PROV_DIR/status"
+
+	WIFI_DONE=0
+	ADMIN_DONE=0
+	HOSTNAME_DONE=0
+
+	log "Provisioning control files created in $PROV_DIR"
+	log "To provision manually:"
+	log "  echo 'YourSSID' > $PROV_DIR/ssid"
+	log "  echo 'YourPassword' > $PROV_DIR/password"
+	log "  echo 'admin' > $PROV_DIR/admin_username"
+	log "  echo 'SecurePass123' > $PROV_DIR/admin_password"
+	log "  echo 'my-camera' > $PROV_DIR/hostname"
+
+	# Monitor for changes
+	while true; do
+		SOMETHING_CHANGED=0
+
+		# Check for WiFi credentials
+		if [ $WIFI_DONE -eq 0 ] && [ -s "$PROV_DIR/ssid" ] && [ -s "$PROV_DIR/password" ]; then
+			SSID=$(cat "$PROV_DIR/ssid" | tr -d '\n\r')
+			PASS=$(cat "$PROV_DIR/password" | tr -d '\n\r')
+
+			if [ -n "$SSID" ] && [ -n "$PASS" ]; then
+				log "Received WiFi credentials via BLE: SSID=$SSID"
+				echo "wifi_connecting" > "$PROV_DIR/status"
+
+				STATUS=$(apply_wifi_credentials "$SSID" "$PASS")
+				echo "$STATUS" > "$PROV_DIR/status"
+
+				if [ "$STATUS" = "connected" ]; then
+					WIFI_DONE=1
+					log "WiFi provisioning successful"
+				fi
+
+				# Clear for next attempt
+				> "$PROV_DIR/ssid"
+				> "$PROV_DIR/password"
+				SOMETHING_CHANGED=1
+			fi
+		fi
+
+		# Check for admin credentials
+		# SECURITY: Only allow setting admin if not already configured
+		if [ $ADMIN_DONE -eq 0 ] && [ -s "$PROV_DIR/admin_password" ]; then
+			# Double-check admin not already set (security)
+			if is_admin_configured; then
+				log "WARNING: Admin already configured, ignoring BLE admin change request"
+				> "$PROV_DIR/admin_username"
+				> "$PROV_DIR/admin_password"
+				ADMIN_DONE=1  # Mark as done to prevent loop
+			else
+				USERNAME=$(cat "$PROV_DIR/admin_username" | tr -d '\n\r')
+				ADMINPASS=$(cat "$PROV_DIR/admin_password" | tr -d '\n\r')
+
+				# Default to root if no username provided
+				[ -z "$USERNAME" ] && USERNAME="root"
+
+				if [ -n "$ADMINPASS" ]; then
+					log "Received admin credentials via BLE: user=$USERNAME"
+					echo "admin_setting" > "$PROV_DIR/status"
+
+					STATUS=$(apply_admin_credentials "$USERNAME" "$ADMINPASS")
+					echo "$STATUS" > "$PROV_DIR/status"
+
+					if [ "$STATUS" = "admin_set" ]; then
+						ADMIN_DONE=1
+						log "Admin credentials set successfully"
+					fi
+
+					# Clear for next attempt
+					> "$PROV_DIR/admin_username"
+					> "$PROV_DIR/admin_password"
+					SOMETHING_CHANGED=1
+				fi
+			fi
+		fi
+
+		# Check for hostname
+		if [ $HOSTNAME_DONE -eq 0 ] && [ -s "$PROV_DIR/hostname" ]; then
+			NEWHOSTNAME=$(cat "$PROV_DIR/hostname" | tr -d '\n\r')
+
+			if [ -n "$NEWHOSTNAME" ]; then
+				log "Received hostname via BLE: $NEWHOSTNAME"
+				echo "hostname_setting" > "$PROV_DIR/status"
+
+				STATUS=$(apply_hostname "$NEWHOSTNAME")
+				echo "$STATUS" > "$PROV_DIR/status"
+
+				if [ "$STATUS" = "hostname_set" ]; then
+					HOSTNAME_DONE=1
+					log "Hostname set successfully"
+				fi
+
+				# Clear for next attempt
+				> "$PROV_DIR/hostname"
+				SOMETHING_CHANGED=1
+			fi
+		fi
+
+		# Check if we're fully provisioned
+		if [ $WIFI_DONE -eq 1 ] && [ $ADMIN_DONE -eq 1 ]; then
+			log "All provisioning complete!"
+			echo "completed" > "$PROV_DIR/status"
+			sleep 3  # Give client time to read status
+			break
+		fi
+
+		# Update status if changes but not complete
+		if [ $SOMETHING_CHANGED -eq 1 ]; then
+			# Build status message
+			if [ $WIFI_DONE -eq 1 ] && [ $ADMIN_DONE -eq 0 ]; then
+				echo "wifi_done_need_admin" > "$PROV_DIR/status"
+			elif [ $WIFI_DONE -eq 0 ] && [ $ADMIN_DONE -eq 1 ]; then
+				echo "admin_done_need_wifi" > "$PROV_DIR/status"
+			elif [ $WIFI_DONE -eq 0 ] && [ $ADMIN_DONE -eq 0 ]; then
+				echo "waiting" > "$PROV_DIR/status"
+			fi
+		fi
+
+		sleep 2
+	done
+
+	# Stop advertising
+	bluetoothctl discoverable off
+	log "BLE provisioning service stopped"
+}
+
+# Main
+main() {
+	log "=== BLE Complete Provisioning Service Starting ==="
+
+	check_dependencies
+
+	# Check if provisioning needed
+	if ! needs_provisioning; then
+		log "Device already fully provisioned"
+		exit 0
+	fi
+
+	if ! is_wifi_configured; then
+		log "WiFi not configured"
+	fi
+	if ! is_admin_configured; then
+		log "Admin credentials not configured"
+	fi
+
+	log "Starting BLE provisioning service"
+
+	# Cleanup on exit
+	trap "bluetoothctl discoverable off; rm -rf /tmp/ble_provision; log 'Shutting down'; exit 0" INT TERM
+
+	start_advertising
+	provision_loop
+}
+
+# Subcommand handlers
+cmd_scan() {
+	scan_wifi
+}
+
+cmd_apply() {
+	SSID="$1"
+	PASS="$2"
+	if [ -z "$SSID" ] || [ -z "$PASS" ]; then
+		log "ERROR: SSID and password required"
+		echo "error"
+		exit 1
+	fi
+	apply_wifi_credentials "$SSID" "$PASS"
+}
+
+cmd_set_admin() {
+	USERNAME="${1:-root}"
+	PASSWORD="$2"
+	if [ -z "$PASSWORD" ]; then
+		log "ERROR: Password required"
+		echo "error"
+		exit 1
+	fi
+	apply_admin_credentials "$USERNAME" "$PASSWORD"
+}
+
+cmd_set_hostname() {
+	HOSTNAME="$1"
+	if [ -z "$HOSTNAME" ]; then
+		log "ERROR: Hostname required"
+		echo "error"
+		exit 1
+	fi
+	apply_hostname "$HOSTNAME"
+}
+
+cmd_status() {
+	if [ -f /tmp/ble_provision/status ]; then
+		cat /tmp/ble_provision/status
+	else
+		echo "unknown"
+	fi
+}
+
+# Parse subcommands
+case "${1:-}" in
+	scan)
+		cmd_scan
+		;;
+	apply)
+		shift
+		cmd_apply "$@"
+		;;
+	set-admin)
+		shift
+		cmd_set_admin "$@"
+		;;
+	set-hostname)
+		shift
+		cmd_set_hostname "$@"
+		;;
+	status)
+		cmd_status
+		;;
+	""|start)
+		# Run main provisioning service
+		main
+		;;
+	*)
+		echo "Usage: $0 {start|scan|apply|set-admin|set-hostname|status}"
+		echo ""
+		echo "Commands:"
+		echo "  start            - Start BLE provisioning service (default)"
+		echo "  scan             - Scan and return WiFi networks as JSON"
+		echo "  apply SSID PASS  - Apply WiFi credentials"
+		echo "  set-admin [USER] PASS - Set admin credentials (default user: root)"
+		echo "  set-hostname NAME     - Set device hostname"
+		echo "  status           - Get provisioning status"
+		exit 1
+		;;
+esac
+

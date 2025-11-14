@@ -1,0 +1,319 @@
+From 0a8d6979620b45a40bbef490ea8a4a2a95198100 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Wed, 12 Nov 2025 20:58:36 -0800
+Subject: [PATCH 4/4] Add HCI LE Advertising API support for BlueZ with service
+ UUID fix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This patch adds comprehensive BLE advertising support for the ATBM6031X
+driver, enabling BlueZ to manage advertising and make GATT services
+automatically visible to BLE scanners.
+
+The ATBM6031X BLE firmware has advertising support but doesn't expose it
+through the standard HCI interface that BlueZ expects. This patch intercepts
+HCI LE advertising commands and translates them to the firmware's proprietary
+advertising API.
+
+CRITICAL BUG FIX: The original advertising implementation had a logic bug where
+advertising data and scan response data were only sent to firmware if advertising
+was already enabled. Since commands arrive in sequence (Params → Data → ScanRsp → Enable),
+the data was stored but never sent, causing phones to connect without seeing GATT
+services and disconnecting after 30 seconds.
+
+This patch adds (CONFIG_ATBM_BLE_ADV_COEXIST):
+
+1. HCI LE Advertising Command Handlers:
+   - LE Read Local Supported Features (0x2003) - Report advertising capability
+   - LE Set Advertising Parameters (0x2006) - Configure intervals
+   - LE Set Advertising Data (0x2008) - Set advertising payload
+   - LE Set Scan Response Data (0x2009) - Set scan response payload
+   - LE Set Advertise Enable (0x200A) - Start/stop advertising
+     * FIXED: Now sends stored advertising data to firmware after enabling
+
+2. BR/EDR Disable Command Handlers:
+   - Write Scan Enable (0x0C1A) - Disable BR/EDR scanning
+   - Write LE Host Supported (0x0C6D) - Enable LE-only mode
+
+3. Command Interception in send_frame:
+   - Intercepts outgoing HCI commands
+   - Routes LE advertising commands to handler functions
+   - Sends Command Complete responses back to BlueZ
+   - Passes non-advertising commands to firmware normally
+
+This allows BlueZ to:
+- Detect LE advertising support via feature query
+- Expose LEAdvertisingManager1 D-Bus interface
+- Manage BLE advertising through standard bluetoothctl commands
+- Make registered GATT services automatically visible to BLE scanners
+- Applications can use BlueZ advertising API without firmware changes
+---
+ hal_apollo/mac80211/ble.c | 244 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 244 insertions(+)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index b749a93..d49e7f1 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -1019,6 +1019,213 @@ static void ieee80211_ble_bluez_destruct(struct hci_dev *hdev)
+ 	
+ }
+ #endif
++
++#ifdef CONFIG_ATBM_BLE_ADV_COEXIST
++/* Forward declaration */
++static struct ieee80211_local *ble_to_local(struct platform_device *pble_dev);
++
++/* Storage for advertising parameters set via HCI */
++static struct {
++	bool enabled;
++	uint8_t adv_data[31];
++	uint8_t adv_data_len;
++	uint8_t scan_rsp[31];
++	uint8_t scan_rsp_len;
++	uint16_t interval_min;
++	uint16_t interval_max;
++} atbm_adv_state = {0};
++
++/* Handle HCI LE Set Advertising Parameters command */
++static int atbm_handle_le_set_adv_params(struct ieee80211_local *local, const uint8_t *data)
++{
++	/* Parameters: min_interval(2) max_interval(2) type(1) own_addr(1) peer_addr(7) channel(1) filter(1) */
++	atbm_adv_state.interval_min = data[0] | (data[1] << 8);
++	atbm_adv_state.interval_max = data[2] | (data[3] << 8);
++
++	atbm_printk_init("ble: Set advertising params interval=%d-%d\n",
++			atbm_adv_state.interval_min, atbm_adv_state.interval_max);
++	return 0;
++}
++
++/* Handle HCI LE Set Advertising Data command */
++static int atbm_handle_le_set_adv_data(struct ieee80211_local *local, const uint8_t *data)
++{
++	struct atbm_common *hw_priv = local->hw.priv;
++	struct wsm_ble_msg_adv_data ble_adv = {0};
++
++	atbm_adv_state.adv_data_len = data[0];
++	if (atbm_adv_state.adv_data_len > 31)
++		atbm_adv_state.adv_data_len = 31;
++
++	memcpy(atbm_adv_state.adv_data, &data[1], atbm_adv_state.adv_data_len);
++	atbm_printk_init("ble: Set advertising data len=%d\n", atbm_adv_state.adv_data_len);
++
++	/* If advertising is enabled, update it */
++	if (atbm_adv_state.enabled) {
++		/* Copy advertising data to firmware format */
++		memcpy(&ble_adv.mac, atbm_adv_state.adv_data,
++		       min_t(size_t, atbm_adv_state.adv_data_len, sizeof(ble_adv.mac)));
++		ble_adv.ble_id = BLE_MSG_SET_ADV_DATA;
++
++		wsm_ble_msg_set_adv_data(hw_priv, &ble_adv, 0);
++	}
++
++	return 0;
++}
++
++/* Handle HCI LE Set Scan Response Data command */
++static int atbm_handle_le_set_scan_rsp(struct ieee80211_local *local, const uint8_t *data)
++{
++	struct atbm_common *hw_priv = local->hw.priv;
++	struct wsm_ble_msg_resp_data ble_rsp = {0};
++
++	atbm_adv_state.scan_rsp_len = data[0];
++	if (atbm_adv_state.scan_rsp_len > 31)
++		atbm_adv_state.scan_rsp_len = 31;
++
++	memcpy(atbm_adv_state.scan_rsp, &data[1], atbm_adv_state.scan_rsp_len);
++	atbm_printk_init("ble: Set scan response len=%d\n", atbm_adv_state.scan_rsp_len);
++
++	/* If advertising is enabled, update scan response */
++	if (atbm_adv_state.enabled) {
++		ble_rsp.resp_data_len = atbm_adv_state.scan_rsp_len;
++		memcpy(ble_rsp.resp_data, atbm_adv_state.scan_rsp, atbm_adv_state.scan_rsp_len);
++		ble_rsp.ble_id = BLE_MSG_SET_RESP_DATA;
++
++		wsm_ble_msg_set_adv_data(hw_priv, (struct wsm_ble_msg_adv_data*)&ble_rsp, 0);
++	}
++
++	return 0;
++}
++
++/* Handle HCI LE Set Advertise Enable command */
++static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const uint8_t *data)
++{
++	struct atbm_common *hw_priv = local->hw.priv;
++	bool enable = data[0] != 0;
++
++	atbm_printk_init("ble: Set advertising enable=%d\n", enable);
++
++	if (enable) {
++		/* Start advertising with current parameters */
++		struct ioctl_ble_start ble_start = {0};
++
++		/* Convert 0.625ms units to milliseconds */
++		ble_start.ble_interval = (atbm_adv_state.interval_max * 625) / 1000;
++		if (ble_start.ble_interval == 0)
++			ble_start.ble_interval = 100; /* default 100ms */
++
++		ble_start.ble_adv = 1;
++		ble_start.ble_scan = 0;
++		ble_start.ble_adv_chan = 39; /* Use channel 39 (2480 MHz) */
++
++		atbm_ioctl_ble_adv_coexit_start(local, (u8*)&ble_start);
++		atbm_adv_state.enabled = true;
++
++		/* Now send the previously stored advertising data to firmware */
++		if (atbm_adv_state.adv_data_len > 0) {
++			struct wsm_ble_msg_adv_data ble_adv = {0};
++			memcpy(&ble_adv.mac, atbm_adv_state.adv_data,
++			       min_t(size_t, atbm_adv_state.adv_data_len, sizeof(ble_adv.mac)));
++			ble_adv.ble_id = BLE_MSG_SET_ADV_DATA;
++			wsm_ble_msg_set_adv_data(hw_priv, &ble_adv, 0);
++			atbm_printk_init("ble: Sent stored advertising data to firmware (len=%d)\n",
++					atbm_adv_state.adv_data_len);
++		}
++
++		/* And send the scan response data */
++		if (atbm_adv_state.scan_rsp_len > 0) {
++			struct wsm_ble_msg_resp_data ble_rsp = {0};
++			ble_rsp.resp_data_len = atbm_adv_state.scan_rsp_len;
++			memcpy(ble_rsp.resp_data, atbm_adv_state.scan_rsp, atbm_adv_state.scan_rsp_len);
++			ble_rsp.ble_id = BLE_MSG_SET_RESP_DATA;
++			wsm_ble_msg_set_adv_data(hw_priv, (struct wsm_ble_msg_adv_data*)&ble_rsp, 0);
++			atbm_printk_init("ble: Sent stored scan response data to firmware (len=%d)\n",
++					atbm_adv_state.scan_rsp_len);
++		}
++	} else {
++		/* Stop advertising */
++		struct wsm_ble_msg ble_stop = {0};
++		ble_stop.ble_id = BLE_MSG_COEXIST_STOP;
++		wsm_ble_msg_coexist_stop(hw_priv, &ble_stop, 0);
++		atbm_adv_state.enabled = false;
++	}
++
++	return 0;
++}
++
++/* Handle HCI LE Read Local Supported Features command */
++static int atbm_handle_le_read_local_features(struct ieee80211_local *local, struct hci_dev *hdev)
++{
++	/*
++	 * Report LE advertising support to BlueZ
++	 * Feature bits (8 bytes):
++	 * Byte 0, Bit 0: LE Encryption
++	 * Byte 0, Bit 1: Connection Parameters Request Procedure
++	 * Byte 0, Bit 2: Extended Reject Indication
++	 * Byte 0, Bit 3: Slave-initiated Features Exchange
++	 * Byte 0, Bit 4: LE Ping
++	 * Byte 0, Bit 5: LE Data Packet Length Extension
++	 * We'll enable basic features needed for advertising
++	 */
++	uint8_t event[15] = {
++		0x04,       /* HCI Event */
++		0x0E,       /* Command Complete */
++		0x0C,       /* Length (12 bytes) */
++		0x01,       /* Num packets */
++		0x03, 0x20, /* Opcode: LE Read Local Supported Features */
++		0x00,       /* Status: success */
++		/* 8 bytes of LE features - report basic advertising support */
++		0x1F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++	};
++
++	atbm_printk_init("ble: Reporting LE features to BlueZ (advertising supported)\n");
++	ieee80211_ble_dev_recv(&local->hw, event, sizeof(event));
++	return 0;
++}
++
++/* Handle HCI Write Scan Enable command (disable BR/EDR) */
++static int atbm_handle_write_scan_enable(struct ieee80211_local *local, const uint8_t *data)
++{
++	atbm_printk_init("ble: Write Scan Enable (value=0x%02x) - BR/EDR disabled\n", data[0]);
++	return 0;
++}
++
++/* Handle HCI Write LE Host Supported command (LE-only mode) */
++static int atbm_handle_write_le_host_supported(struct ieee80211_local *local, const uint8_t *data)
++{
++	atbm_printk_init("ble: Write LE Host Supported (LE=%d, SimultLE_BR_EDR=%d)\n",
++			data[0], data[1]);
++	return 0;
++}
++
++/* Intercept and handle HCI LE advertising commands */
++static bool atbm_handle_hci_le_command(struct ieee80211_local *local, struct sk_buff *skb, struct hci_dev *hdev)
++{
++	uint16_t opcode;
++	const uint8_t *data;
++
++	if (skb->len < 4)
++		return false;
++
++	/* Skip HCI packet type byte */
++	data = skb->data + 1;
++	opcode = data[0] | (data[1] << 8);
++	data += 3; /* Skip opcode and length */
++
++	switch (opcode) {
++	case 0x0C1A: return atbm_handle_write_scan_enable(local, data) == 0;
++	case 0x0C6D: return atbm_handle_write_le_host_supported(local, data) == 0;
++	case 0x2003: return atbm_handle_le_read_local_features(local, hdev) == 0;
++	case 0x2006: return atbm_handle_le_set_adv_params(local, data) == 0;
++	case 0x2008: return atbm_handle_le_set_adv_data(local, data) == 0;
++	case 0x2009: return atbm_handle_le_set_scan_rsp(local, data) == 0;
++	case 0x200A: return atbm_handle_le_set_adv_enable(local, data) == 0;
++	default: return false;
++	}
++}
++#endif /* CONFIG_ATBM_BLE_ADV_COEXIST */
++
+ static int ieee80211_ble_bluez_send_frame(
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0))
+ 			struct hci_dev *hdev,
+@@ -1052,6 +1259,43 @@ static int ieee80211_ble_bluez_send_frame(
+ 		hdev->stat.sco_tx++;
+ 		break;
+ 	};
++
++#ifdef CONFIG_ATBM_BLE_ADV_COEXIST
++	/* Intercept HCI commands for LE advertising */
++	if (bt_cb(skb)->pkt_type == HCI_COMMAND_PKT && skb->len >= 4) {
++		uint8_t event[7];
++		struct ieee80211_local *local = ble_to_local(pdev);
++		uint16_t opcode;
++		const uint8_t *cmd_data;
++
++		/* Extract opcode to check which command it is */
++		cmd_data = skb->data + 1;
++		opcode = cmd_data[0] | (cmd_data[1] << 8);
++
++		if (atbm_handle_hci_le_command(local, skb, hdev)) {
++			/* Command handled */
++			/* For LE Read Local Supported Features, response already sent */
++			if (opcode == 0x2003) {
++				goto exit;
++			}
++
++			/* For other commands, send generic success response */
++			event[0] = 0x04; /* HCI Event */
++			event[1] = 0x0E; /* Command Complete */
++			event[2] = 0x04; /* Length */
++			event[3] = 0x01; /* Num packets */
++			event[4] = 0x00; event[5] = 0x00; /* Opcode (filled from command) */
++			event[6] = 0x00; /* Status: success */
++			/* Copy opcode from command */
++			if (skb->len >= 3) {
++				memcpy(&event[4], skb->data + 1, 2);
++			}
++			ieee80211_ble_dev_recv(&local->hw, event, sizeof(event));
++			goto exit;
++		}
++	}
++#endif /* CONFIG_ATBM_BLE_ADV_COEXIST */
++
+ 	atbm_printk_ble("bluez send(%d)(%d)\n",bt_cb(skb)->pkt_type,skb->len);
+ 
+ 	/* Check if this is an unsupported command that we need to fake */
+-- 
+2.39.5 (Apple Git-154)
+

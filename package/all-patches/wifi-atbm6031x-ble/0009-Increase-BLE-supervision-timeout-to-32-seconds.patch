@@ -1,0 +1,48 @@
+From acdf0f363f9a981c30c28b20a4c9a05d34443612 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Thu, 13 Nov 2025 15:06:29 -0800
+Subject: [PATCH] Increase BLE supervision timeout to 32 seconds
+
+The hardcoded supervision timeout of 0x0048 (720ms) was way too short
+for GATT server connections. This caused disconnections during service
+discovery when there were pauses between ATT requests.
+
+Changes:
+- Increase timeout from 0x0048 (720ms) to 0x0C80 (32 seconds)
+- Add logging to confirm when timeout is being set
+- Apply to both normal and fallback code paths
+
+Note: This only affects BR/EDR to LE connection conversion. If the
+firmware sends native LE Connection Complete events, this code won't
+be triggered and the firmware's own timeout (~10 seconds) will be used.
+---
+ hal_apollo/mac80211/ble.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 62f3191..67159b7 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -76,7 +76,8 @@ static struct sk_buff *atbm_convert_to_le_connection(struct sk_buff *skb)
+ 		memcpy(&new_skb->data[8], &data[5], 6);  /* Peer address */
+ 		new_skb->data[14] = 0x30; new_skb->data[15] = 0x00; /* Interval: 60ms */
+ 		new_skb->data[16] = 0x00; new_skb->data[17] = 0x00; /* Latency: 0 */
+-		new_skb->data[18] = 0x48; new_skb->data[19] = 0x00; /* Timeout: 7.2s */
++		new_skb->data[18] = 0x80; new_skb->data[19] = 0x0C; /* Timeout: 32s (max) */
++		atbm_printk_always("BLE: Set supervision timeout to 32 seconds\n");
+ 		new_skb->data[20] = 0x00; /* Master clock accuracy */
+ 	} else {
+ 		/* Fallback with minimal valid data */
+@@ -84,7 +85,8 @@ static struct sk_buff *atbm_convert_to_le_connection(struct sk_buff *skb)
+ 		new_skb->data[6] = 0x01;  /* Role: Slave */
+ 		new_skb->data[7] = 0x01;  /* Peer address type: Random */
+ 		new_skb->data[14] = 0x30; new_skb->data[15] = 0x00; /* Interval: 60ms */
+-		new_skb->data[18] = 0x48; new_skb->data[19] = 0x00; /* Timeout: 7.2s */
++		new_skb->data[18] = 0x80; new_skb->data[19] = 0x0C; /* Timeout: 32s (max) */
++		atbm_printk_always("BLE: Set supervision timeout to 32 seconds (fallback)\n");
+ 	}
+
+ 	kfree_skb(skb);
+--
+2.39.5 (Apple Git-154)
+

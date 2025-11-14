@@ -1,0 +1,133 @@
+From 4ae640453fb041c52fc6b9e6c3b6122267f6a7b9 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Wed, 12 Nov 2025 20:57:01 -0800
+Subject: [PATCH 3/4] Add BR/EDR to LE connection conversion and unconditional
+ HCI_LE_ENABLED flag
+
+This patch enables SMP (Security Manager Protocol) support for BLE connections
+by unconditionally setting the HCI_LE_ENABLED flag and optionally converting
+BR/EDR connection events to LE connection events.
+
+The ATBM6031X BLE firmware reports connections as BR/EDR (Classic Bluetooth)
+instead of LE (Low Energy). Additionally, the Linux kernel's SMP implementation
+requires the HCI_LE_ENABLED flag to be set, otherwise it terminates connections
+immediately with 'reason 3' (Connection Terminated by Local Host).
+
+This patch adds:
+
+1. Unconditional HCI_LE_ENABLED flag:
+   - Set in ieee80211_ble_bluez_recv() for all incoming connections
+   - Ensures kernel SMP code proceeds with security exchange
+   - Not conditional on CONFIG_ATBM_BLE_ADV_COEXIST
+
+2. Connection Event Conversion (CONFIG_ATBM_BLE_ADV_COEXIST):
+   - Intercepts BR/EDR Connection Complete events (0x03)
+   - Converts them to LE Connection Complete events (0x3E subevent 0x01)
+   - Sets peer address type to Random (0x01)
+   - Configures LE connection parameters (interval, latency, timeout)
+
+This allows:
+- SMP pairing and encryption to work correctly
+- GATT services to be accessible over LE connections
+- Connections to be maintained without immediate termination
+---
+ hal_apollo/mac80211/ble.c | 76 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 901418b..b749a93 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -23,6 +23,74 @@ static void  ieee80211_ble_dump(const char *string,u8 *mem,size_t len);
+ #include <net/bluetooth/bluetooth.h>
+ #include <net/bluetooth/hci_core.h>
+ #endif
++
++#ifdef CONFIG_ATBM_BLE_ADV_COEXIST
++/* Convert BR/EDR Connection Complete to LE Connection Complete */
++static struct sk_buff *atbm_convert_to_le_connection(struct sk_buff *skb)
++{
++	struct sk_buff *new_skb;
++	uint8_t *data = skb->data;
++	uint8_t event_code, param_len;
++
++	/* Check if this is an HCI event packet */
++	if (bt_cb(skb)->pkt_type != 0x04) /* HCI_EVENT_PKT */
++		return skb;
++
++	if (skb->len < 3)
++		return skb;
++
++	event_code = data[0];
++	param_len = data[1];
++
++	/* Log all HCI events for debugging */
++	atbm_printk_init("ble: HCI Event received: code=0x%02x len=%d\n", event_code, param_len);
++
++	/* Check if this is a Connection Complete event (0x03) */
++	if (event_code != 0x03)
++		return skb;
++
++	atbm_printk_init("ble: Converting BR/EDR Connection Complete to LE Connection Complete\n");
++
++	/* Create new LE Connection Complete event (0x3E subevent 0x01) */
++	new_skb = bt_skb_alloc(21, GFP_ATOMIC);
++	if (!new_skb) {
++		atbm_printk_err("ble: Failed to allocate skb for LE event conversion\n");
++		return skb;
++	}
++
++	memcpy(new_skb->cb, skb->cb, sizeof(skb->cb));
++	bt_cb(new_skb)->pkt_type = 0x04;
++
++	skb_put(new_skb, 21);
++	new_skb->data[0] = 0x3E;  /* LE Meta Event */
++	new_skb->data[1] = 0x13;  /* Parameter length (19 bytes) */
++	new_skb->data[2] = 0x01;  /* Subevent: LE Connection Complete */
++
++	/* Copy connection parameters from original event */
++	if (skb->len >= 13) {
++		new_skb->data[3] = data[2];   /* Status */
++		new_skb->data[4] = data[3];   /* Connection handle (low) */
++		new_skb->data[5] = data[4];   /* Connection handle (high) */
++		new_skb->data[6] = 0x01;      /* Role: Slave (peripheral) */
++		new_skb->data[7] = 0x01;      /* Peer address type: Random */
++		memcpy(&new_skb->data[8], &data[5], 6);  /* Peer address */
++		new_skb->data[14] = 0x30; new_skb->data[15] = 0x00; /* Interval: 60ms */
++		new_skb->data[16] = 0x00; new_skb->data[17] = 0x00; /* Latency: 0 */
++		new_skb->data[18] = 0x48; new_skb->data[19] = 0x00; /* Timeout: 7.2s */
++		new_skb->data[20] = 0x00; /* Master clock accuracy */
++	} else {
++		/* Fallback with minimal valid data */
++		memset(&new_skb->data[3], 0, 18);
++		new_skb->data[6] = 0x01;  /* Role: Slave */
++		new_skb->data[7] = 0x01;  /* Peer address type: Random */
++		new_skb->data[14] = 0x30; new_skb->data[15] = 0x00; /* Interval: 60ms */
++		new_skb->data[18] = 0x48; new_skb->data[19] = 0x00; /* Timeout: 7.2s */
++	}
++
++	kfree_skb(skb);
++	return new_skb;
++}
++#endif /* CONFIG_ATBM_BLE_ADV_COEXIST */
+ #define IEEE80211_BLE_SKB_HEADNEED	128
+ 
+ static char *ieee80211_ble_commb_ble_alloc_xmit(struct platform_device *pble_dev,size_t len);
+@@ -738,6 +806,14 @@ err:
+ #ifdef CONFIG_ATBM_SUPPORT_BLUEZ
+ static void ieee80211_ble_bluez_recv(struct hci_dev *hdev,struct sk_buff *skb)
+ {
++	/* Ensure LE is enabled for incoming connections */
++	set_bit(HCI_LE_ENABLED, &hdev->dev_flags);
++
++#ifdef CONFIG_ATBM_BLE_ADV_COEXIST
++	/* Convert BR/EDR connections to LE connections */
++	skb = atbm_convert_to_le_connection(skb);
++#endif
++
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 0))
+ 	hci_recv_frame(hdev,skb);
+ #else
+-- 
+2.39.5 (Apple Git-154)
+

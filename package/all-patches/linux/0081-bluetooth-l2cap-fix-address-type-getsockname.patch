@@ -1,0 +1,48 @@
+From e21a67f300f83ad651b4ca9c8093b2ff2e18324c Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Tue, 11 Nov 2025 10:00:57 -0800
+Subject: [PATCH] bluetooth: l2cap: Fix address type for getsockname (source
+ address)
+
+BlueZ uses getsockname() to detect the link type, but the previous
+patch only set l2_bdaddr_type for getpeername() (peer=1), not for
+getsockname() (peer=0).
+
+This caused bluetoothd to always see connections as BR/EDR, which
+blocks MTU Exchange for LE connections (MTU_REQ returns error 0x06).
+
+Fix by setting l2_bdaddr_type for source address as well.
+---
+ net/bluetooth/l2cap_sock.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/net/bluetooth/l2cap_sock.c b/net/bluetooth/l2cap_sock.c
+index fe294468..57e7f8a4 100644
+--- a/net/bluetooth/l2cap_sock.c
++++ b/net/bluetooth/l2cap_sock.c
+@@ -288,6 +288,22 @@ static int l2cap_sock_getname(struct socket *sock, struct sockaddr *addr,
+ 		la->l2_psm = chan->sport;
+ 		bacpy(&la->l2_bdaddr, &bt_sk(sk)->src);
+ 		la->l2_cid = cpu_to_le16(chan->scid);
++
++		/* Set address type from connection info for source address too */
++		hcon = chan->conn ? chan->conn->hcon : NULL;
++		if (hcon) {
++			if (hcon->type == LE_LINK) {
++				la->l2_bdaddr_type = hcon->dst_type;
++				printk(KERN_ERR "BLE_DEBUG: l2cap_sock_getname src: LE_LINK, dst_type=%d, CID=%d\n",
++				       hcon->dst_type, chan->scid);
++			} else {
++				la->l2_bdaddr_type = BDADDR_BREDR;
++				printk(KERN_ERR "BLE_DEBUG: l2cap_sock_getname src: BR/EDR, type=%d, CID=%d\n",
++				       hcon->type, chan->scid);
++			}
++		} else {
++			printk(KERN_ERR "BLE_DEBUG: l2cap_sock_getname src: NO hcon! CID=%d\n", chan->scid);
++		}
+ 	}
+
+ 	return 0;
+--
+2.39.5 (Apple Git-154)
+

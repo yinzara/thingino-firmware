@@ -1,0 +1,209 @@
+#!/bin/sh
+#
+# S65ble-proxy - Bluetooth Proxy Service for Home Assistant
+#
+# ESPHome API-compatible BLE proxy that scans for nearby devices
+# and forwards advertisements to Home Assistant via ESPHome Native API.
+#
+# Compatible with:
+# - Home Assistant Bluetooth integration
+# - Bermuda (room-level presence tracking)
+# - Any ESPHome API consumer
+#
+# The camera acts as a BLE receiver/scanner - like ESPHome bluetooth_proxy
+# or Shelly BLE Gateway. It extends Home Assistant's Bluetooth range.
+#
+
+DAEMON="ble-proxy-daemon"
+DAEMON_PATH="/usr/sbin/$DAEMON"
+PIDFILE="/var/run/ble-proxy.pid"
+
+# Source rc.common for helper functions if available
+[ -f /etc/rc.common ] && . /etc/rc.common
+
+# Logging helper
+log() {
+	echo "$*"
+	logger -t ble-proxy "$*"
+}
+
+# Check if proxy should be enabled
+is_proxy_enabled() {
+	# Check environment variable
+	PROXY_ENABLED=$(fw_printenv -n ble_proxy_enabled 2>/dev/null)
+
+	if [ "$PROXY_ENABLED" = "true" ] || [ "$PROXY_ENABLED" = "1" ]; then
+		return 0  # Enabled
+	fi
+
+	# Default: disabled
+	return 1
+}
+
+# Check if Home Assistant host configured
+is_ha_configured() {
+	HA_HOST=$(fw_printenv -n ble_proxy_ha_host 2>/dev/null)
+
+	if [ -n "$HA_HOST" ]; then
+		return 0  # Configured
+	fi
+
+	return 1
+}
+
+# Check dependencies
+check_dependencies() {
+	# Check if Bluetooth hardware available
+	if ! hciconfig hci0 >/dev/null 2>&1; then
+		log "ERROR: Bluetooth interface hci0 not found"
+		return 1
+	fi
+
+	# Check if bluetoothd is running
+	if ! pidof bluetoothd >/dev/null; then
+		log "Starting bluetoothd first..."
+		/etc/init.d/S39bluetooth start
+		sleep 2
+	fi
+
+	# Check if daemon exists
+	if [ ! -x "$DAEMON_PATH" ]; then
+		log "ERROR: $DAEMON_PATH not found or not executable"
+		return 1
+	fi
+
+	return 0
+}
+
+# Get proxy configuration
+get_proxy_config() {
+	# Home Assistant host (required)
+	HA_HOST=$(fw_printenv -n ble_proxy_ha_host 2>/dev/null)
+	[ -z "$HA_HOST" ] && HA_HOST=""
+
+	# Home Assistant port (default: 6053)
+	HA_PORT=$(fw_printenv -n ble_proxy_ha_port 2>/dev/null)
+	[ -z "$HA_PORT" ] && HA_PORT=6053
+
+	# Bluetooth adapter (default: hci0)
+	ADAPTER=$(fw_printenv -n ble_proxy_adapter 2>/dev/null)
+	[ -z "$ADAPTER" ] && ADAPTER="hci0"
+
+	# Get hostname for device identification
+	DEVICE_NAME=$(hostname)
+
+	export HA_HOST HA_PORT ADAPTER DEVICE_NAME
+}
+
+# Start proxy daemon
+start_proxy() {
+	log "Starting BLE proxy daemon (C native)..."
+	log "Device Name: $DEVICE_NAME"
+	log "Home Assistant: $HA_HOST:$HA_PORT"
+	log "Adapter: $ADAPTER"
+
+	# Set Bluetooth device name to hostname
+	hciconfig $ADAPTER name "$DEVICE_NAME" 2>/dev/null
+	if [ $? -ne 0 ]; then
+		# Fallback: try bluetoothctl
+		echo "system-alias $DEVICE_NAME" | bluetoothctl 2>/dev/null
+	fi
+
+	# Start daemon in background
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON_PATH"
+
+	if [ $? -eq 0 ]; then
+		log "BLE proxy daemon started successfully"
+		log "Scanning for nearby BLE devices..."
+		log "Forwarding advertisements to Home Assistant at $HA_HOST:$HA_PORT"
+		log "Device will appear as '$DEVICE_NAME' in HA"
+		return 0
+	else
+		log "ERROR: Failed to start BLE proxy daemon"
+		return 1
+	fi
+}
+
+start() {
+	if ! is_proxy_enabled; then
+		log "BLE proxy disabled (set ble_proxy_enabled=true to enable)"
+		return 0
+	fi
+
+	if ! is_ha_configured; then
+		log "ERROR: Home Assistant host not configured (set ble_proxy_ha_host)"
+		return 1
+	fi
+
+	if ! check_dependencies; then
+		return 1
+	fi
+
+	get_proxy_config
+	start_proxy
+
+	log "BLE proxy service started successfully"
+	log "Camera is now acting as a Bluetooth receiver for Home Assistant"
+	log "Compatible with Bermuda for room-level tracking"
+
+	return 0
+}
+
+stop() {
+	log "Stopping BLE proxy service..."
+
+	# Stop daemon using PID file
+	if [ -f "$PIDFILE" ]; then
+		start-stop-daemon -K -p "$PIDFILE"
+		rm -f "$PIDFILE"
+		log "BLE proxy daemon stopped"
+	else
+		# Fallback: kill by name
+		killall $DAEMON 2>/dev/null
+		log "BLE proxy stopped"
+	fi
+
+	return 0
+}
+
+restart() {
+	stop
+	sleep 2
+	start
+}
+
+status() {
+	if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+		echo "BLE proxy is running (PID: $(cat "$PIDFILE"))"
+
+		# Show configuration
+		get_proxy_config
+		echo "Home Assistant: $HA_HOST:$HA_PORT"
+		echo "Adapter: $ADAPTER"
+		echo "Device Name: $DEVICE_NAME"
+
+		return 0
+	else
+		echo "BLE proxy is not running"
+		return 1
+	fi
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart|reload)
+		restart
+		;;
+	status)
+		status
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status}"
+		exit 1
+		;;
+esac

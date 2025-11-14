@@ -1,0 +1,124 @@
+#!/bin/sh
+#
+# S41ble-provision - BLE WiFi Provisioning Init Script
+#
+# Starts BLE provisioning service if WiFi is not configured
+# Runs after S39bluetooth and before network services
+#
+
+DAEMON="ble-gatt-server"
+DAEMON_PATH="/usr/sbin/$DAEMON"
+PIDFILE="/var/run/ble-provision.pid"
+
+# Source rc.common for helper functions if available
+[ -f /etc/rc.common ] && . /etc/rc.common
+
+# Logging helper
+log() {
+	echo "$*"
+	logger -t ble-provision "$*"
+}
+
+# Check if WiFi is already configured
+is_wifi_configured() {
+	# Check U-Boot environment for wlanssid
+	if fw_printenv wlanssid 2>/dev/null | grep -q "wlanssid="; then
+		return 0  # Configured
+	fi
+
+	# Check if wpa_supplicant config exists
+	if [ -f /etc/wpa_supplicant.conf ] && grep -q "^network=" /etc/wpa_supplicant.conf 2>/dev/null; then
+		return 0  # Configured
+	fi
+
+	return 1  # Not configured
+}
+
+# Check if admin is configured
+is_admin_configured() {
+	# Check if root password is set (not empty or default)
+	local shadow_entry=$(grep "^root:" /etc/shadow 2>/dev/null | cut -d: -f2)
+
+	if [ -z "$shadow_entry" ] || [ "$shadow_entry" = "*" ] || [ "$shadow_entry" = "!" ]; then
+		return 1  # No password set
+	fi
+
+	return 0  # Password configured
+}
+
+# Check if BLE provisioning should be enabled
+should_enable() {
+	# Check environment variable
+	if [ "$(fw_printenv -n enable_ble_provision 2>/dev/null)" = "false" ]; then
+		return 1  # Disabled by user
+	fi
+
+	# Check if Bluetooth hardware available
+	if ! hciconfig hci0 >/dev/null 2>&1; then
+		return 1  # No Bluetooth
+	fi
+
+	# SECURITY: Only enable if BOTH WiFi AND admin are not configured
+	# This prevents changing admin credentials after device is on network
+	if ! is_wifi_configured || ! is_admin_configured; then
+		return 0  # Enable provisioning (initial setup)
+	fi
+
+	return 1  # Don't enable (already configured)
+}
+
+start() {
+	if ! should_enable; then
+		log "BLE provisioning not needed (WiFi + admin configured or disabled)"
+		return 0
+	fi
+
+	log "Starting BLE WiFi provisioning service..."
+
+	# Ensure bluetoothd is running
+	if ! pidof bluetoothd >/dev/null; then
+		log "Starting bluetoothd first..."
+		/etc/init.d/S39bluetooth start
+		sleep 2
+	fi
+
+	# Start C GATT server
+	if [ -x "$DAEMON_PATH" ]; then
+		start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON_PATH"
+		[ $? = 0 ] && log "BLE provisioning service started (C native)"
+		return $?
+	else
+		log "ERROR: $DAEMON_PATH not found or not executable"
+		return 1
+	fi
+}
+
+stop() {
+	log "Stopping BLE WiFi provisioning service..."
+	start-stop-daemon -K -q -p "$PIDFILE"
+	rm -f "$PIDFILE"
+	rm -rf /tmp/ble_provision
+	return 0
+}
+
+restart() {
+	stop
+	sleep 1
+	start
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart|reload)
+		restart
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac

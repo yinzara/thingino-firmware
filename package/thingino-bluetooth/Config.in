@@ -1,0 +1,12 @@
+config BR2_PACKAGE_THINGINO_BLUETOOTH
+	bool "thingino-bluetooth"
+	depends on BR2_PACKAGE_BLUEZ5_UTILS
+	help
+	  Thingino Bluetooth Low Energy utilities
+
+	  Provides BLE provisioning and proxy functionality
+	  for Home Assistant integration.
+
+	  Features included:
+	  - ble-provision: Complete device setup via BLE
+	  - ble-proxy: BLE scanner/proxy for Home Assistant

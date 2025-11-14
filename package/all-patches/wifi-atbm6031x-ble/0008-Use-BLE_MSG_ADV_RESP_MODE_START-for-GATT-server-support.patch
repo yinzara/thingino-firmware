@@ -1,0 +1,93 @@
+From d0d800f40078521fe6d824694575f18aa3620391 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Thu, 13 Nov 2025 14:18:20 -0800
+Subject: [PATCH] Use BLE_MSG_ADV_RESP_MODE_START for GATT server support
+
+CRITICAL FIX: Switch from basic advertising coexistence mode (BLE_MSG_COEXIST_START)
+to advertising-with-response mode (BLE_MSG_ADV_RESP_MODE_START).
+
+The coexistence mode (0x00) is designed for advertising-only operation and cannot
+maintain stable GATT server connections. It disconnects after ~8 seconds due to
+supervision timeout.
+
+The advertising-response mode (0x03) is specifically designed for bidirectional
+GATT communication and should maintain stable connections for service discovery
+and characteristic operations.
+
+IMPORTANT: The initialization order matters! Must send advertising data and scan
+response data BEFORE starting the ADV_RESP mode. This matches the order used in
+the ATBM coexistence demo code:
+1. Set advertising data (BLE_MSG_SET_ADV_DATA)
+2. Set scan response data (BLE_MSG_SET_RESP_DATA)
+3. Start ADV_RESP mode (BLE_MSG_ADV_RESP_MODE_START) - LAST!
+
+This resolves the issue where connections were accepted but immediately
+disconnected during service discovery.
+---
+ hal_apollo/mac80211/ble.c | 35 +++++++++++++++++++----------------
+ 1 file changed, 19 insertions(+), 16 deletions(-)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 9ea33c0..62f3191 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -1142,22 +1142,10 @@ static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const ui
+ 	atbm_printk_init("ble: Set advertising enable=%d\n", enable);
+ 
+ 	if (enable) {
+-		/* Start advertising with current parameters */
+-		struct ioctl_ble_start ble_start = {0};
++		/* Send advertising and scan response data BEFORE starting mode (order matters!) */
++		/* This matches the order used in the ATBM coexistence demo */
+ 
+-		/* Convert 0.625ms units to milliseconds */
+-		ble_start.ble_interval = (atbm_adv_state.interval_max * 625) / 1000;
+-		if (ble_start.ble_interval == 0)
+-			ble_start.ble_interval = 100; /* default 100ms */
+-
+-		ble_start.ble_adv = 1;
+-		ble_start.ble_scan = 0;
+-		ble_start.ble_adv_chan = 39; /* Use channel 39 (2480 MHz) */
+-
+-		atbm_ioctl_ble_adv_coexit_start(local, (u8*)&ble_start);
+-		atbm_adv_state.enabled = true;
+-
+-		/* Now send the previously stored advertising data to firmware */
++		/* First send the advertising data to firmware */
+ 		if (atbm_adv_state.adv_data_len > 0) {
+ 			struct wsm_ble_msg_adv_data ble_adv = {0};
+ 			int i;
+@@ -1180,7 +1168,7 @@ static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const ui
+ 					atbm_adv_state.adv_data_len);
+ 		}
+ 
+-		/* And send the scan response data */
++		/* Then send the scan response data */
+ 		if (atbm_adv_state.scan_rsp_len > 0) {
+ 			struct wsm_ble_msg_resp_data ble_rsp = {0};
+ 			int i;
+@@ -1200,6 +1188,21 @@ static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const ui
+ 			atbm_printk_init("ble: Sent stored scan response data to firmware (len=%d)\n",
+ 					atbm_adv_state.scan_rsp_len);
+ 		}
++
++		/* FINALLY start advertising in RESPONSE MODE (must be last!) */
++		{
++			struct ioctl_ble_adv_resp_start ble_resp_start = {0};
++
++			/* Convert 0.625ms units to milliseconds */
++			ble_resp_start.ble_interval = (atbm_adv_state.interval_max * 625) / 1000;
++			if (ble_resp_start.ble_interval == 0)
++				ble_resp_start.ble_interval = 100; /* default 100ms */
++
++			atbm_printk_init("ble: Starting advertising in RESP mode (interval=%dms) for GATT server\n",
++					ble_resp_start.ble_interval);
++			atbm_ioctl_ble_adv_resp_start(local, (u8*)&ble_resp_start);
++			atbm_adv_state.enabled = true;
++		}
+ 	} else {
+ 		/* Stop advertising */
+ 		struct wsm_ble_msg ble_stop = {0};
+-- 
+2.39.5 (Apple Git-154)
+

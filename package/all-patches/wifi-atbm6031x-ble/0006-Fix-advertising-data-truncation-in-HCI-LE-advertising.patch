@@ -1,0 +1,57 @@
+From d81849d2826c209706268ec289ada7c2862c7143 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Thu, 13 Nov 2025 13:15:35 -0800
+Subject: [PATCH] Fix advertising data truncation in HCI LE advertising handler
+
+CRITICAL BUG FIX: Patch 0004 had a bug where advertising data was being
+copied into the wrong structure field, truncating 128-bit service UUIDs
+to only 6 bytes instead of the full 21+ bytes.
+
+The wsm_ble_msg_adv_data structure has proper fields:
+- mac[6] - BLE MAC address (or zeros to use default)
+- adv_data_len - Advertising data length
+- adv_data[31] - Advertising data payload (up to 31 bytes)
+
+This patch fixes the handlers to properly populate all three fields
+instead of copying advertising data into the 6-byte mac field.
+
+This allows full 128-bit service UUIDs to be advertised correctly.
+---
+ hal_apollo/mac80211/ble.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 1dec4f3..79cf84f 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -1075,9 +1075,11 @@ static int atbm_handle_le_set_adv_data(struct ieee80211_local *local, const uint
+ 
+ 	/* If advertising is enabled, update it */
+ 	if (atbm_adv_state.enabled) {
+-		/* Copy advertising data to firmware format */
+-		memcpy(&ble_adv.mac, atbm_adv_state.adv_data,
+-		       min_t(size_t, atbm_adv_state.adv_data_len, sizeof(ble_adv.mac)));
++		/* Set up firmware structure with advertising data */
++		memset(ble_adv.mac, 0, sizeof(ble_adv.mac));  /* Use device default MAC */
++		ble_adv.adv_data_len = atbm_adv_state.adv_data_len;
++		memcpy(ble_adv.adv_data, atbm_adv_state.adv_data,
++		       atbm_adv_state.adv_data_len);
+ 		ble_adv.ble_id = BLE_MSG_SET_ADV_DATA;
+ 
+ 		wsm_ble_msg_set_adv_data(hw_priv, &ble_adv, 0);
+@@ -1138,8 +1140,10 @@ static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const ui
+ 		/* Now send the previously stored advertising data to firmware */
+ 		if (atbm_adv_state.adv_data_len > 0) {
+ 			struct wsm_ble_msg_adv_data ble_adv = {0};
+-			memcpy(&ble_adv.mac, atbm_adv_state.adv_data,
+-			       min_t(size_t, atbm_adv_state.adv_data_len, sizeof(ble_adv.mac)));
++			memset(ble_adv.mac, 0, sizeof(ble_adv.mac));  /* Use device default MAC */
++			ble_adv.adv_data_len = atbm_adv_state.adv_data_len;
++			memcpy(ble_adv.adv_data, atbm_adv_state.adv_data,
++			       atbm_adv_state.adv_data_len);
+ 			ble_adv.ble_id = BLE_MSG_SET_ADV_DATA;
+ 			wsm_ble_msg_set_adv_data(hw_priv, &ble_adv, 0);
+ 			atbm_printk_init("ble: Sent stored advertising data to firmware (len=%d)\n",
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,66 @@
+// Simplified ESPHome Native API Protocol Definitions
+// For Thingino BLE Proxy - Only includes messages needed for BLE functionality
+//
+// Based on ESPHome API: https://github.com/esphome/esphome/blob/dev/esphome/components/api/api.proto
+
+syntax = "proto3";
+
+// HelloRequest - Initial handshake
+message HelloRequest {
+  string client_info = 1;
+  uint32 api_version_major = 2;
+  uint32 api_version_minor = 3;
+}
+
+// HelloResponse - Server response to hello
+message HelloResponse {
+  uint32 api_version_major = 1;
+  uint32 api_version_minor = 2;
+  string server_info = 3;
+  string name = 4;
+}
+
+// ConnectRequest - Establish connection
+message ConnectRequest {
+  string password = 1;
+}
+
+// ConnectResponse - Connection result
+message ConnectResponse {
+  bool invalid_password = 1;
+}
+
+// DisconnectRequest - Clean disconnect
+message DisconnectRequest {}
+
+// DisconnectResponse - Disconnect acknowledgment
+message DisconnectResponse {}
+
+// PingRequest - Keepalive ping
+message PingRequest {}
+
+// PingResponse - Ping acknowledgment
+message PingResponse {}
+
+// SubscribeBluetoothLEAdvertisementsRequest - Subscribe to BLE proxy
+message SubscribeBluetoothLEAdvertisementsRequest {
+  uint32 flags = 1;
+}
+
+// BluetoothLEAdvertisementResponse - BLE advertisement data
+message BluetoothLEAdvertisementResponse {
+  uint64 address = 1;
+  string name = 2;
+  sint32 rssi = 3;
+  repeated string service_uuids = 4;
+  repeated BluetoothServiceData service_data = 5;
+  repeated BluetoothServiceData manufacturer_data = 6;
+  uint32 address_type = 7;
+}
+
+// BluetoothServiceData - Service or manufacturer data
+message BluetoothServiceData {
+  string uuid = 1;
+  repeated uint32 legacy_data = 2;
+  bytes data = 3;
+}

@@ -1,0 +1,30 @@
+From ed940dd1ef4eb414f6383b41ed9e303bf870c610 Mon Sep 17 00:00:00 2001
+From: Thingino Build <build@thingino.com>
+Date: Sun, 10 Nov 2024 14:50:00 +0000
+Subject: [PATCH 1/4] Fix BlueZ HCI bus type for SDIO
+
+Change HCI_USB to HCI_SDIO for ATBM6031X SDIO WiFi/BLE combo chip.
+The driver uses SDIO interface, not USB, so the HCI bus type must
+be set correctly for BlueZ to recognize the Bluetooth controller.
+
+Signed-off-by: Thingino Build <build@thingino.com>
+---
+ hal_apollo/mac80211/ble.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 51003e0..e3a40a8 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -938,7 +938,7 @@ static int ieee80211_ble_bluez_init(struct ieee80211_ble_cdev *ble_cdev)
+ 	}
+ 
+ 	ble_cdev->hdev = hdev;
+-	hdev->bus = HCI_USB;
++	hdev->bus = HCI_SDIO;
+ 	SET_HCIDEV_DEV(hdev, &ble_cdev->pdev->dev);
+ 	dev_set_drvdata(&hdev->dev, ble_cdev);
+ 
+-- 
+2.39.5 (Apple Git-154)
+

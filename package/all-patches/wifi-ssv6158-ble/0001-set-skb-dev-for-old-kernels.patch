@@ -1,0 +1,31 @@
+From: Claude <noreply@anthropic.com>
+Date: Wed, 13 Nov 2024 15:00:00 +0000
+Subject: [PATCH] Set skb->dev for kernels < 3.13 in HCI receive path
+
+For kernel versions older than 3.13, hci_recv_frame() expects skb->dev
+to be set to the HCI device structure. Without this, the kernel cannot
+route the received packets to the correct HCI device.
+
+This is critical for proper HCI operation on kernel 3.10 (used by Thingino).
+
+Signed-off-by: Claude <noreply@anthropic.com>
+---
+ smac/bdev.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/smac/bdev.c b/smac/bdev.c
+index 1234567..89abcdef 100644
+--- a/smac/bdev.c
++++ b/smac/bdev.c
+@@ -96,6 +96,9 @@ int ssv_ble_hci_rx_packet(u8 *rx_packet, u32 rx_len)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
+     hci_recv_frame(ssv_hdev,bskb);
+ #else
++    /* For older kernels, must set skb->dev to the HCI device */
++    bskb->dev = (void *)ssv_hdev;
++
+     hci_recv_frame(bskb);
+ #endif
+ #endif
+--
+2.34.1

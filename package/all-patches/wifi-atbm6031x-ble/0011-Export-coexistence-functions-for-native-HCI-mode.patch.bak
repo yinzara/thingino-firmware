@@ -1,0 +1,50 @@
+From 17563a5ad8fefca3f1271b9d4b68f17b3e34e0a5 Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Thu, 13 Nov 2025 17:23:43 -0800
+Subject: [PATCH] Export coexistence functions for native HCI mode
+
+Split #ifdef blocks to export wsm_ble_msg_coexist_start/stop for both
+CONFIG_ATBM_BLE_ADV_COEXIST and CONFIG_WIFI_BT_COMB modes, while keeping
+wsm_ble_msg_set_adv_data and wsm_ble_indication only for ADV_COEXIST mode.
+---
+ hal_apollo/wsm.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/hal_apollo/wsm.c b/hal_apollo/wsm.c
+index 063dae4..e3cbad4 100644
+--- a/hal_apollo/wsm.c
++++ b/hal_apollo/wsm.c
+@@ -3727,9 +3727,9 @@ int wsm_phy_read_reg_bit_u32(struct atbm_common *hw_priv, const wsm_regval_bit *
+ nomem:
+ 	return -ENOMEM;
+ }
+-	
+ 
+-#ifdef CONFIG_ATBM_BLE_ADV_COEXIST
++
++#if defined(CONFIG_ATBM_BLE_ADV_COEXIST) || defined(CONFIG_WIFI_BT_COMB)
+ int wsm_ble_msg_coexist_start(struct atbm_common *hw_priv, const struct wsm_ble_msg_coex_start *arg,
+ 										int if_id)
+ {
+@@ -3788,7 +3788,9 @@ nomem:
+ 	return -ENOMEM;
+ 
+ }
++#endif /* CONFIG_ATBM_BLE_ADV_COEXIST || CONFIG_WIFI_BT_COMB */
+ 
++#ifdef CONFIG_ATBM_BLE_ADV_COEXIST
+ int wsm_ble_msg_set_adv_data(struct atbm_common *hw_priv, const struct wsm_ble_msg_adv_data *arg,
+ 										int if_id)
+ {
+@@ -3855,7 +3857,7 @@ underflow:
+ 	return 0;
+ }
+ 
+-#endif
++#endif /* CONFIG_ATBM_BLE_ADV_COEXIST */
+ #ifdef CONFIG_ATBM_BLE
+ int wsm_ble_xmit(struct atbm_common *hw_priv,u8 *xmit,size_t len)
+ {
+-- 
+2.39.5 (Apple Git-154)
+

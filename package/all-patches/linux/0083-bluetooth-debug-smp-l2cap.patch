@@ -1,0 +1,187 @@
+From ed0a05d1e13016aa7dc835170771147bb88d962d Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Tue, 11 Nov 2025 01:02:27 -0800
+Subject: [PATCH] bluetooth: Add comprehensive debug logging for SMP and L2CAP
+
+Add detailed printk debug messages to track:
+- When l2cap_conn_del is called and why (with err code)
+- SMP security initialization and all return paths
+- SMP command transmission and reception
+- HCI_LE_ENABLED flag status checks
+- Connection state and security level changes
+- Master/slave role and LTK encryption attempts
+
+This will help diagnose BLE connection termination issues.
+---
+ net/bluetooth/l2cap_core.c | 21 +++++++--
+ net/bluetooth/smp.c        | 45 +++++++++++++++++---
+ 2 files changed, 56 insertions(+), 10 deletions(-)
+
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index c11a28ba..7f64856d 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -1114,13 +1114,17 @@ static void l2cap_move_done(struct l2cap_chan *chan)
+
+ static void l2cap_chan_ready(struct l2cap_chan *chan)
+ {
++	printk(KERN_ERR "BLE_DEBUG: l2cap_chan_ready called for CID=%d, setting state to BT_CONNECTED\n",
++	       chan->scid);
+ 	/* This clears all conf flags, including CONF_NOT_COMPLETE */
+ 	chan->conf_state = 0;
+ 	__clear_chan_timer(chan);
+
+ 	chan->state = BT_CONNECTED;
+
++	printk(KERN_ERR "BLE_DEBUG: Calling chan->ops->ready for CID=%d\n", chan->scid);
+ 	chan->ops->ready(chan);
++	printk(KERN_ERR "BLE_DEBUG: chan->ops->ready completed for CID=%d\n", chan->scid);
+ }
+
+ static void l2cap_start_connection(struct l2cap_chan *chan)
+@@ -1378,16 +1382,23 @@ static void l2cap_conn_ready(struct l2cap_conn *conn)
+ 	struct l2cap_chan *chan;
+ 	struct hci_conn *hcon = conn->hcon;
+
++	printk(KERN_ERR "BLE_DEBUG: l2cap_conn_ready called, hcon->out=%d, hcon->type=%d\n",
++	       hcon->out, hcon->type);
+ 	BT_DBG("conn %p", conn);
+
+-	if (!hcon->out && hcon->type == LE_LINK)
++	if (!hcon->out && hcon->type == LE_LINK) {
++		printk(KERN_ERR "BLE_DEBUG: Calling l2cap_le_conn_ready for incoming LE connection\n");
+ 		l2cap_le_conn_ready(conn);
++	}
+
+-	if (hcon->out && hcon->type == LE_LINK)
++	if (hcon->out && hcon->type == LE_LINK) {
++		printk(KERN_ERR "BLE_DEBUG: Calling smp_conn_security for outgoing LE connection\n");
+ 		smp_conn_security(hcon, hcon->pending_sec_level);
++	}
+
+ 	mutex_lock(&conn->chan_lock);
+
++	printk(KERN_ERR "BLE_DEBUG: Iterating channels to make them ready\n");
+ 	list_for_each_entry(chan, &conn->chan_l, list) {
+
+ 		l2cap_chan_lock(chan);
+@@ -1398,7 +1409,10 @@ static void l2cap_conn_ready(struct l2cap_conn *conn)
+ 		}
+
+ 		if (hcon->type == LE_LINK) {
+-			if (smp_conn_security(hcon, chan->sec_level))
++			int sec_ret = smp_conn_security(hcon, chan->sec_level);
++			printk(KERN_ERR "BLE_DEBUG: Channel CID=%d, sec_level=%d, smp_conn_security returned %d\n",
++			       chan->scid, chan->sec_level, sec_ret);
++			if (sec_ret)
+ 				l2cap_chan_ready(chan);
+
+ 		} else if (chan->chan_type != L2CAP_CHAN_CONN_ORIENTED) {
+@@ -1537,6 +1551,7 @@ static void l2cap_conn_del(struct hci_conn *hcon, int err)
+ 	if (!conn)
+ 		return;
+
++	printk(KERN_ERR "BLE_DEBUG: l2cap_conn_del called, err=%d (hcon=%p, conn=%p)\n", err, hcon, conn);
+ 	BT_DBG("hcon %p conn %p, err %d", hcon, conn, err);
+
+ 	kfree_skb(conn->rx_skb);
+diff --git a/net/bluetooth/smp.c b/net/bluetooth/smp.c
+index b5562abd..bb09b106 100644
+--- a/net/bluetooth/smp.c
++++ b/net/bluetooth/smp.c
+@@ -768,46 +768,74 @@ int smp_conn_security(struct hci_conn *hcon, __u8 sec_level)
+ 	struct smp_chan *smp = conn->smp_chan;
+ 	__u8 authreq;
+
++	printk(KERN_ERR "BLE_DEBUG: smp_conn_security called, sec_level=%d, link_mode=0x%x\n",
++	       sec_level, hcon->link_mode);
++	printk(KERN_ERR "BLE_DEBUG: smp_conn_security: hcon->type=%d, hcon->out=%d, hcon->sec_level=%d, conn->smp_chan=%p\n",
++	       hcon->type, hcon->out, hcon->sec_level, conn->smp_chan);
+ 	BT_DBG("conn %p hcon %p level 0x%2.2x", conn, hcon, sec_level);
+
+-	if (!test_bit(HCI_LE_ENABLED, &hcon->hdev->dev_flags))
++	if (!test_bit(HCI_LE_ENABLED, &hcon->hdev->dev_flags)) {
++		printk(KERN_ERR "BLE_DEBUG: HCI_LE_ENABLED not set! Returning 1\n");
+ 		return 1;
++	}
+
+-	if (sec_level == BT_SECURITY_LOW)
++	if (sec_level == BT_SECURITY_LOW) {
++		printk(KERN_ERR "BLE_DEBUG: Security level is LOW, returning 1 (no pairing needed)\n");
+ 		return 1;
++	}
+
+-	if (hcon->sec_level >= sec_level)
++	if (hcon->sec_level >= sec_level) {
++		printk(KERN_ERR "BLE_DEBUG: Already authenticated at level %d >= %d, returning 1\n",
++		       hcon->sec_level, sec_level);
+ 		return 1;
++	}
+
+-	if (hcon->link_mode & HCI_LM_MASTER)
+-		if (smp_ltk_encrypt(conn, sec_level))
++	if (hcon->link_mode & HCI_LM_MASTER) {
++		printk(KERN_ERR "BLE_DEBUG: We are master, trying LTK encrypt\n");
++		if (smp_ltk_encrypt(conn, sec_level)) {
++			printk(KERN_ERR "BLE_DEBUG: LTK encrypt succeeded, going to done\n");
+ 			goto done;
++		}
++		printk(KERN_ERR "BLE_DEBUG: LTK encrypt failed or not available\n");
++	}
+
+-	if (test_and_set_bit(HCI_CONN_LE_SMP_PEND, &hcon->flags))
++	if (test_and_set_bit(HCI_CONN_LE_SMP_PEND, &hcon->flags)) {
++		printk(KERN_ERR "BLE_DEBUG: SMP already pending, returning 0\n");
+ 		return 0;
++	}
+
++	printk(KERN_ERR "BLE_DEBUG: Creating SMP channel\n");
+ 	smp = smp_chan_create(conn);
+-	if (!smp)
++	if (!smp) {
++		printk(KERN_ERR "BLE_DEBUG: Failed to create SMP channel, returning 1\n");
+ 		return 1;
++	}
+
+ 	authreq = seclevel_to_authreq(sec_level);
++	printk(KERN_ERR "BLE_DEBUG: authreq=0x%x\n", authreq);
+
+ 	if (hcon->link_mode & HCI_LM_MASTER) {
+ 		struct smp_cmd_pairing cp;
++		printk(KERN_ERR "BLE_DEBUG: We are master, building SMP_CMD_PAIRING_REQ\n");
+
+ 		build_pairing_cmd(conn, &cp, NULL, authreq);
+ 		smp->preq[0] = SMP_CMD_PAIRING_REQ;
+ 		memcpy(&smp->preq[1], &cp, sizeof(cp));
+
++		printk(KERN_ERR "BLE_DEBUG: Sending SMP_CMD_PAIRING_REQ\n");
+ 		smp_send_cmd(conn, SMP_CMD_PAIRING_REQ, sizeof(cp), &cp);
+ 	} else {
+ 		struct smp_cmd_security_req cp;
++		printk(KERN_ERR "BLE_DEBUG: We are slave, sending SMP_CMD_SECURITY_REQ\n");
+ 		cp.auth_req = authreq;
++		printk(KERN_ERR "BLE_DEBUG: Sending SMP_CMD_SECURITY_REQ\n");
+ 		smp_send_cmd(conn, SMP_CMD_SECURITY_REQ, sizeof(cp), &cp);
+ 	}
+
+ done:
+ 	hcon->pending_sec_level = sec_level;
++	printk(KERN_ERR "BLE_DEBUG: smp_conn_security set pending_sec_level=%d, returning 0 (success)\n",
++	       sec_level);
+
+ 	return 0;
+ }
+@@ -851,7 +879,10 @@ int smp_sig_channel(struct l2cap_conn *conn, struct sk_buff *skb)
+ 	__u8 reason;
+ 	int err = 0;
+
++	printk(KERN_ERR "BLE_DEBUG: smp_sig_channel received command 0x%02x, len=%d\n", code, skb->len);
++
+ 	if (!test_bit(HCI_LE_ENABLED, &conn->hcon->hdev->dev_flags)) {
++		printk(KERN_ERR "BLE_DEBUG: SMP rejected - HCI_LE_ENABLED not set!\n");
+ 		err = -ENOTSUPP;
+ 		reason = SMP_PAIRING_NOTSUPP;
+ 		goto done;
+--
+2.39.5 (Apple Git-154)
+

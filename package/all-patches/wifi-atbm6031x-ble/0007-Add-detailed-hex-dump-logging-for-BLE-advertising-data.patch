@@ -1,0 +1,102 @@
+From 5b0517b19507316d7e0dd0a4fd795e8745e2c35d Mon Sep 17 00:00:00 2001
+From: Matthew Vance <yinzara@gmail.com>
+Date: Thu, 13 Nov 2025 13:44:15 -0800
+Subject: [PATCH] Add detailed hex dump logging for BLE advertising data
+
+This patch adds comprehensive hex dump logging to track exactly what
+advertising data is being sent through the driver to the firmware.
+
+Logging added:
+1. Hex dump of advertising data when received from HCI command
+2. Hex dump of firmware structure fields when sending to firmware
+3. Hex dump of scan response data when sending to firmware
+
+This will help debug why the 128-bit service UUID is not appearing
+in BLE scanners despite correct HCI command structure.
+---
+ hal_apollo/mac80211/ble.c | 40 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+diff --git a/hal_apollo/mac80211/ble.c b/hal_apollo/mac80211/ble.c
+index 79cf84f..9ea33c0 100644
+--- a/hal_apollo/mac80211/ble.c
++++ b/hal_apollo/mac80211/ble.c
+@@ -1073,6 +1073,15 @@ static int atbm_handle_le_set_adv_data(struct ieee80211_local *local, const uint
+ 	memcpy(atbm_adv_state.adv_data, &data[1], atbm_adv_state.adv_data_len);
+ 	atbm_printk_init("ble: Set advertising data len=%d\n", atbm_adv_state.adv_data_len);
+ 
++	/* Hex dump of advertising data for debugging */
++	{
++		int i;
++		atbm_printk_always("BLE ADV DATA RECEIVED (len=%d): ", atbm_adv_state.adv_data_len);
++		for (i = 0; i < atbm_adv_state.adv_data_len; i++)
++			atbm_printk_always("%02x ", atbm_adv_state.adv_data[i]);
++		atbm_printk_always("\n");
++	}
++
+ 	/* If advertising is enabled, update it */
+ 	if (atbm_adv_state.enabled) {
+ 		/* Set up firmware structure with advertising data */
+@@ -1082,6 +1091,17 @@ static int atbm_handle_le_set_adv_data(struct ieee80211_local *local, const uint
+ 		       atbm_adv_state.adv_data_len);
+ 		ble_adv.ble_id = BLE_MSG_SET_ADV_DATA;
+ 
++		/* Hex dump of firmware structure */
++		{
++			int i;
++			atbm_printk_always("BLE SENDING TO FIRMWARE: ble_id=%d adv_data_len=%d\n",
++					ble_adv.ble_id, ble_adv.adv_data_len);
++			atbm_printk_always("  -> adv_data: ");
++			for (i = 0; i < ble_adv.adv_data_len; i++)
++				atbm_printk_always("%02x ", ble_adv.adv_data[i]);
++			atbm_printk_always("\n");
++		}
++
+ 		wsm_ble_msg_set_adv_data(hw_priv, &ble_adv, 0);
+ 	}
+ 
+@@ -1140,11 +1160,21 @@ static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const ui
+ 		/* Now send the previously stored advertising data to firmware */
+ 		if (atbm_adv_state.adv_data_len > 0) {
+ 			struct wsm_ble_msg_adv_data ble_adv = {0};
++			int i;
+ 			memset(ble_adv.mac, 0, sizeof(ble_adv.mac));  /* Use device default MAC */
+ 			ble_adv.adv_data_len = atbm_adv_state.adv_data_len;
+ 			memcpy(ble_adv.adv_data, atbm_adv_state.adv_data,
+ 			       atbm_adv_state.adv_data_len);
+ 			ble_adv.ble_id = BLE_MSG_SET_ADV_DATA;
++
++			/* Hex dump of firmware structure */
++			atbm_printk_always("BLE ENABLE: SENDING ADV DATA TO FIRMWARE: ble_id=%d adv_data_len=%d\n",
++					ble_adv.ble_id, ble_adv.adv_data_len);
++			atbm_printk_always("  -> adv_data: ");
++			for (i = 0; i < ble_adv.adv_data_len; i++)
++				atbm_printk_always("%02x ", ble_adv.adv_data[i]);
++			atbm_printk_always("\n");
++
+ 			wsm_ble_msg_set_adv_data(hw_priv, &ble_adv, 0);
+ 			atbm_printk_init("ble: Sent stored advertising data to firmware (len=%d)\n",
+ 					atbm_adv_state.adv_data_len);
+@@ -1153,9 +1183,19 @@ static int atbm_handle_le_set_adv_enable(struct ieee80211_local *local, const ui
+ 		/* And send the scan response data */
+ 		if (atbm_adv_state.scan_rsp_len > 0) {
+ 			struct wsm_ble_msg_resp_data ble_rsp = {0};
++			int i;
+ 			ble_rsp.resp_data_len = atbm_adv_state.scan_rsp_len;
+ 			memcpy(ble_rsp.resp_data, atbm_adv_state.scan_rsp, atbm_adv_state.scan_rsp_len);
+ 			ble_rsp.ble_id = BLE_MSG_SET_RESP_DATA;
++
++			/* Hex dump of scan response data */
++			atbm_printk_always("BLE ENABLE: SENDING SCAN RSP TO FIRMWARE: ble_id=%d resp_data_len=%d\n",
++					ble_rsp.ble_id, ble_rsp.resp_data_len);
++			atbm_printk_always("  -> resp_data: ");
++			for (i = 0; i < ble_rsp.resp_data_len; i++)
++				atbm_printk_always("%02x ", ble_rsp.resp_data[i]);
++			atbm_printk_always("\n");
++
+ 			wsm_ble_msg_set_adv_data(hw_priv, (struct wsm_ble_msg_adv_data*)&ble_rsp, 0);
+ 			atbm_printk_init("ble: Sent stored scan response data to firmware (len=%d)\n",
+ 					atbm_adv_state.scan_rsp_len);
+-- 
+2.39.5 (Apple Git-154)
+
